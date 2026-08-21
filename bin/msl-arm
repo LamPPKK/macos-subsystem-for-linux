@@ -1,0 +1,867 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+readonly VERSION="0.1.0"
+readonly DEFAULT_VM_NAME="debian"
+readonly DEFAULT_CPUS="4"
+readonly DEFAULT_MEMORY_MB="4096"
+readonly DEFAULT_DISK_SIZE="40G"
+readonly DEFAULT_SSH_PORT="4022"
+readonly DEFAULT_GUEST_USER="debian"
+readonly DEFAULT_IMAGE_URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2"
+readonly DEFAULT_CHECKSUMS_URL="https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
+
+MSL_ARM_HOME="${MSL_ARM_HOME:-${HOME}/.msl-arm}"
+FIRMWARE_CODE=""
+FIRMWARE_VARS_TEMPLATE=""
+
+usage() {
+  cat <<'EOF'
+msl-arm - Linux terminal VM for Apple Silicon Macs
+
+Usage:
+  msl-arm [--home DIR] doctor
+  msl-arm [--home DIR] init [NAME] [options]
+  msl-arm [--home DIR] start [NAME] [--detach]
+  msl-arm [--home DIR] console [NAME]
+  msl-arm [--home DIR] ssh [NAME] [-- COMMAND...]
+  msl-arm [--home DIR] stop [NAME]
+  msl-arm [--home DIR] status [NAME]
+  msl-arm [--home DIR] list
+  msl-arm [--home DIR] command [NAME]
+  msl-arm [--home DIR] config [NAME]
+
+init options:
+  --cpus N           Virtual CPUs (default: 4)
+  --memory MB        Memory in MiB (default: 4096)
+  --disk SIZE        Disk size, for example 40G (default: 40G)
+  --ssh-port PORT    Host port forwarded to guest SSH (default: 4022)
+  --user USER        Linux user created by cloud-init (default: debian)
+  --identity PATH    Existing private SSH key; PATH.pub must also exist
+  --image PATH       Existing Debian ARM64 qcow2 image; skips download
+
+Environment:
+  MSL_ARM_HOME                 State directory (default: ~/.msl-arm)
+  QEMU_FIRMWARE_DIR            Directory containing QEMU EDK2 firmware
+  MSL_ARM_SKIP_HOST_CHECK=1    CI/testing only; bypass macOS ARM64 check
+
+Examples:
+  msl-arm doctor
+  msl-arm init dev
+  msl-arm start dev --detach
+  msl-arm ssh dev
+  msl-arm stop dev
+EOF
+}
+
+say() {
+  printf '[msl-arm] %s\n' "$*"
+}
+
+warn() {
+  printf '[msl-arm] warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf '[msl-arm] error: %s\n' "$*" >&2
+  exit 1
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+  command_exists "$1" || die "missing required command: $1"
+}
+
+absolute_path() {
+  local path="$1"
+  local directory
+  local filename
+
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *)
+      directory=$(dirname "$path")
+      filename=$(basename "$path")
+      directory=$(cd "$directory" 2>/dev/null && pwd -P) || return 1
+      printf '%s/%s\n' "$directory" "$filename"
+      ;;
+  esac
+}
+
+validate_vm_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] ||
+    die "invalid VM name '$1' (use letters, numbers, dot, underscore, or dash)"
+}
+
+validate_guest_user() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
+    die "invalid Linux user '$1'"
+  case "$1" in
+    root|daemon|bin|sys|sync|games|man|lp|mail|news|uucp|proxy|www-data|backup|list|irc|_apt|nobody|systemd-network|systemd-timesync|messagebus|sshd)
+      die "Linux user '$1' is reserved by Debian"
+      ;;
+  esac
+}
+
+validate_integer_range() {
+  local label="$1"
+  local value="$2"
+  local minimum="$3"
+  local maximum="$4"
+  local LC_ALL=C
+
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] ||
+    die "$label must be a positive integer"
+  if ((${#value} < ${#minimum})) ||
+    { ((${#value} == ${#minimum})) && [[ "$value" < "$minimum" ]]; }; then
+    die "$label must be at least $minimum"
+  fi
+  if ((${#value} > ${#maximum})) ||
+    { ((${#value} == ${#maximum})) && [[ "$value" > "$maximum" ]]; }; then
+    die "$label must be at most $maximum"
+  fi
+}
+
+validate_port() {
+  validate_integer_range "SSH port" "$1" "1" "65535"
+}
+
+validate_disk_size() {
+  [[ "$1" =~ ^[1-9][0-9]*[GgMm]$ ]] ||
+    die "disk size must look like 40G or 8192M"
+}
+
+normalize_home() {
+  case "$MSL_ARM_HOME" in
+    /*) ;;
+    *) MSL_ARM_HOME="${PWD}/${MSL_ARM_HOME}" ;;
+  esac
+  MSL_ARM_HOME="${MSL_ARM_HOME%/}"
+  [[ "$MSL_ARM_HOME" != *$'\n'* ]] || die "state directory cannot contain a newline"
+  [[ "$MSL_ARM_HOME" != *,* ]] || die "state directory cannot contain a comma (QEMU option delimiter)"
+  [[ -n "$MSL_ARM_HOME" && "$MSL_ARM_HOME" != "/" ]] ||
+    die "refusing to use the filesystem root as the state directory"
+}
+
+vm_directory() {
+  printf '%s/vms/%s\n' "$MSL_ARM_HOME" "$1"
+}
+
+config_path() {
+  printf '%s/config\n' "$(vm_directory "$1")"
+}
+
+parse_optional_name() {
+  (($# <= 1)) || die "expected at most one VM name"
+  PARSED_NAME="$DEFAULT_VM_NAME"
+  if (($# > 0)); then
+    [[ "$1" != --* ]] || die "unknown option: $1"
+    PARSED_NAME="$1"
+  fi
+  validate_vm_name "$PARSED_NAME"
+}
+
+assert_supported_host() {
+  [[ "${MSL_ARM_SKIP_HOST_CHECK:-0}" == "1" ]] && return 0
+
+  [[ "$(uname -s)" == "Darwin" ]] ||
+    die "this build supports macOS only"
+  [[ "$(uname -m)" == "arm64" ]] ||
+    die "Apple Silicon arm64 is required; open a native (non-Rosetta) terminal"
+
+  if [[ "$(sysctl -n kern.hv_support 2>/dev/null || printf '0')" != "1" ]]; then
+    die "Apple Hypervisor Framework is unavailable on this Mac"
+  fi
+}
+
+find_firmware() {
+  local qemu_prefix=""
+  local candidate
+  local -a candidates=()
+
+  if [[ -n "${QEMU_FIRMWARE_DIR:-}" ]]; then
+    candidates+=("$QEMU_FIRMWARE_DIR")
+  fi
+
+  if command_exists brew; then
+    qemu_prefix=$(brew --prefix qemu 2>/dev/null || true)
+    if [[ -n "$qemu_prefix" ]]; then
+      candidates+=("$qemu_prefix/share/qemu")
+    fi
+  fi
+
+  candidates+=(
+    "/opt/homebrew/share/qemu"
+    "/usr/local/share/qemu"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate/edk2-aarch64-code.fd" && -f "$candidate/edk2-arm-vars.fd" ]]; then
+      [[ "$candidate" != *,* ]] || continue
+      FIRMWARE_CODE="$candidate/edk2-aarch64-code.fd"
+      FIRMWARE_VARS_TEMPLATE="$candidate/edk2-arm-vars.fd"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+doctor_item() {
+  local ok="$1"
+  local label="$2"
+  local detail="$3"
+
+  if [[ "$ok" == "1" ]]; then
+    printf '  [ok]   %-20s %s\n' "$label" "$detail"
+  else
+    printf '  [fail] %-20s %s\n' "$label" "$detail"
+  fi
+}
+
+cmd_doctor() {
+  local failures=0
+  local os
+  local arch
+  local hvf="0"
+  local command_name
+
+  (($# == 0)) || die "doctor does not accept arguments"
+
+  os=$(uname -s)
+  arch=$(uname -m)
+  [[ "$os" == "Darwin" ]] || failures=$((failures + 1))
+  doctor_item "$([[ "$os" == "Darwin" ]] && printf '1' || printf '0')" "operating system" "$os"
+
+  [[ "$arch" == "arm64" ]] || failures=$((failures + 1))
+  doctor_item "$([[ "$arch" == "arm64" ]] && printf '1' || printf '0')" "host architecture" "$arch"
+
+  if [[ "$os" == "Darwin" ]]; then
+    hvf=$(sysctl -n kern.hv_support 2>/dev/null || printf '0')
+  fi
+  [[ "$hvf" == "1" ]] || failures=$((failures + 1))
+  doctor_item "$([[ "$hvf" == "1" ]] && printf '1' || printf '0')" "Hypervisor.framework" "$([[ "$hvf" == "1" ]] && printf 'available' || printf 'unavailable')"
+
+  for command_name in qemu-system-aarch64 qemu-img hdiutil ssh ssh-keygen curl shasum; do
+    if command_exists "$command_name"; then
+      doctor_item "1" "$command_name" "$(command -v "$command_name")"
+    else
+      doctor_item "0" "$command_name" "not found"
+      failures=$((failures + 1))
+    fi
+  done
+
+  if find_firmware; then
+    doctor_item "1" "AArch64 UEFI" "$FIRMWARE_CODE"
+  else
+    doctor_item "0" "AArch64 UEFI" "edk2-aarch64-code.fd / edk2-arm-vars.fd not found"
+    failures=$((failures + 1))
+  fi
+
+  if ((failures > 0)); then
+    warn "$failures required check(s) failed. On Apple Silicon, install QEMU with: brew install qemu"
+    return 1
+  fi
+
+  say "host is ready"
+}
+
+verify_sha512() {
+  local file="$1"
+  local expected="$2"
+  local actual
+
+  actual=$(shasum -a 512 "$file" | awk '{print $1}')
+  [[ "$actual" == "$expected" ]]
+}
+
+download_base_image() {
+  local cache_directory="$MSL_ARM_HOME/cache"
+  local image_name="${DEFAULT_IMAGE_URL##*/}"
+  local image_path="$cache_directory/$image_name"
+  local partial_path="$image_path.partial"
+  local checksums_path="$cache_directory/SHA512SUMS"
+  local checksums_partial="$checksums_path.partial"
+  local expected
+
+  require_command curl
+  require_command shasum
+  mkdir -p "$cache_directory"
+  chmod 700 "$cache_directory"
+
+  say "fetching Debian checksum manifest"
+  curl -fsSL "$DEFAULT_CHECKSUMS_URL" -o "$checksums_partial"
+  mv "$checksums_partial" "$checksums_path"
+
+  expected=$(awk -v image="$image_name" '$2 == image || $2 == "./" image { print $1; exit }' "$checksums_path")
+  [[ "$expected" =~ ^[0-9a-fA-F]{128}$ ]] ||
+    die "could not find $image_name in Debian SHA512SUMS"
+
+  if [[ -f "$image_path" ]] && verify_sha512 "$image_path" "$expected"; then
+    say "using verified cached image: $image_path"
+    BASE_IMAGE_PATH="$image_path"
+    return 0
+  fi
+
+  if [[ -f "$image_path" ]]; then
+    warn "cached image checksum mismatch; downloading a clean copy"
+    rm -f "$image_path"
+  fi
+
+  rm -f "$partial_path"
+  say "downloading Debian ARM64 image"
+  curl -fL --progress-bar "$DEFAULT_IMAGE_URL" -o "$partial_path"
+  verify_sha512 "$partial_path" "$expected" || {
+    rm -f "$partial_path"
+    die "Debian image checksum verification failed"
+  }
+  mv "$partial_path" "$image_path"
+  say "verified SHA-512 checksum"
+  BASE_IMAGE_PATH="$image_path"
+}
+
+prepare_identity() {
+  local requested_identity="$1"
+  local key_directory="$MSL_ARM_HOME/keys"
+  local derived_public_key
+
+  if [[ -n "$requested_identity" ]]; then
+    [[ -f "$requested_identity" ]] || die "SSH private key not found: $requested_identity"
+    [[ -f "$requested_identity.pub" ]] || die "SSH public key not found: $requested_identity.pub"
+    IDENTITY_FILE=$(absolute_path "$requested_identity") ||
+      die "could not resolve identity path: $requested_identity"
+  else
+    IDENTITY_FILE="$key_directory/id_ed25519"
+    if [[ ! -f "$IDENTITY_FILE" || ! -f "$IDENTITY_FILE.pub" ]]; then
+      require_command ssh-keygen
+      mkdir -p "$key_directory"
+      chmod 700 "$key_directory"
+      say "creating an isolated SSH key at $IDENTITY_FILE"
+      ssh-keygen -q -t ed25519 -N '' -C 'msl-arm' -f "$IDENTITY_FILE"
+    fi
+  fi
+
+  [[ "$IDENTITY_FILE" != *$'\n'* ]] || die "SSH identity path cannot contain a newline"
+
+  require_command ssh-keygen
+  PUBLIC_KEY=$(awk 'NF >= 2 && $1 ~ /^(ssh-|ecdsa-|sk-)/ { print $1 " " $2; exit }' "$IDENTITY_FILE.pub")
+  [[ -n "$PUBLIC_KEY" ]] || die "no supported public key found in $IDENTITY_FILE.pub"
+  [[ "${PUBLIC_KEY#* }" =~ ^[A-Za-z0-9+/=]+$ ]] ||
+    die "invalid public key data in $IDENTITY_FILE.pub"
+  ssh-keygen -l -f "$IDENTITY_FILE.pub" >/dev/null 2>&1 ||
+    die "invalid SSH public key: $IDENTITY_FILE.pub"
+  derived_public_key=$(ssh-keygen -y -f "$IDENTITY_FILE" | awk 'NF >= 2 { print $1 " " $2; exit }') ||
+    die "could not read SSH private key: $IDENTITY_FILE"
+  [[ "$derived_public_key" == "$PUBLIC_KEY" ]] ||
+    die "SSH private/public key pair does not match"
+}
+
+write_cloud_init() {
+  local directory="$1"
+  local name="$2"
+  local guest_user="$3"
+  local instance_id
+
+  instance_id="msl-arm-${name}-$(date +%s)"
+  mkdir -p "$directory/cloud-init"
+
+  cat >"$directory/cloud-init/meta-data" <<EOF
+instance-id: '${instance_id}'
+local-hostname: '${name}'
+EOF
+
+  cat >"$directory/cloud-init/user-data" <<EOF
+#cloud-config
+hostname: '${name}'
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: true
+users:
+  - name: '${guest_user}'
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    ssh_authorized_keys:
+      - ${PUBLIC_KEY}
+growpart:
+  mode: auto
+  devices: ['/']
+resize_rootfs: true
+write_files:
+  - path: /etc/default/grub.d/99-msl-arm.cfg
+    permissions: '0644'
+    content: |
+      GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyAMA0,115200n8"
+runcmd:
+  - [systemctl, enable, --now, serial-getty@ttyAMA0.service]
+  - [sh, -c, 'command -v update-grub >/dev/null && update-grub']
+final_message: "msl-arm guest is ready"
+EOF
+}
+
+create_seed_image() {
+  local directory="$1"
+  require_command hdiutil
+
+  hdiutil makehybrid \
+    -o "$directory/seed.iso" \
+    "$directory/cloud-init" \
+    -iso \
+    -joliet \
+    -iso-volume-name cidata \
+    -joliet-volume-name cidata \
+    >/dev/null
+}
+
+write_config() {
+  local directory="$1"
+
+  cat >"$directory/config" <<EOF
+NAME=${VM_NAME}
+CPUS=${CPUS}
+MEMORY_MB=${MEMORY_MB}
+DISK_SIZE=${DISK_SIZE}
+SSH_PORT=${SSH_PORT}
+GUEST_USER=${GUEST_USER}
+IDENTITY_FILE=${IDENTITY_FILE}
+EOF
+}
+
+cleanup_stage() {
+  if [[ -n "${STAGE_DIRECTORY:-}" && -d "$STAGE_DIRECTORY" ]]; then
+    rm -rf "$STAGE_DIRECTORY"
+  fi
+}
+
+cmd_init() {
+  local name="$DEFAULT_VM_NAME"
+  local cpus="$DEFAULT_CPUS"
+  local memory_mb="$DEFAULT_MEMORY_MB"
+  local disk_size="$DEFAULT_DISK_SIZE"
+  local ssh_port="$DEFAULT_SSH_PORT"
+  local guest_user="$DEFAULT_GUEST_USER"
+  local identity=""
+  local source_image=""
+  local target_directory
+  local vms_directory="$MSL_ARM_HOME/vms"
+
+  if (($# > 0)) && [[ "$1" != --* ]]; then
+    name="$1"
+    shift
+  fi
+
+  while (($# > 0)); do
+    case "$1" in
+      --cpus) [[ $# -ge 2 ]] || die "--cpus requires a value"; cpus="$2"; shift 2 ;;
+      --memory) [[ $# -ge 2 ]] || die "--memory requires a value"; memory_mb="$2"; shift 2 ;;
+      --disk) [[ $# -ge 2 ]] || die "--disk requires a value"; disk_size="$2"; shift 2 ;;
+      --ssh-port) [[ $# -ge 2 ]] || die "--ssh-port requires a value"; ssh_port="$2"; shift 2 ;;
+      --user) [[ $# -ge 2 ]] || die "--user requires a value"; guest_user="$2"; shift 2 ;;
+      --identity) [[ $# -ge 2 ]] || die "--identity requires a value"; identity="$2"; shift 2 ;;
+      --image) [[ $# -ge 2 ]] || die "--image requires a value"; source_image="$2"; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown init option: $1" ;;
+    esac
+  done
+
+  validate_vm_name "$name"
+  validate_integer_range "CPU count" "$cpus" "1" "64"
+  validate_integer_range "memory" "$memory_mb" "512" "1048576"
+  validate_disk_size "$disk_size"
+  validate_port "$ssh_port"
+  validate_guest_user "$guest_user"
+
+  assert_supported_host
+  require_command qemu-img
+  find_firmware || die "QEMU AArch64 UEFI firmware not found; run: brew install qemu"
+
+  target_directory=$(vm_directory "$name")
+  [[ ! -e "$target_directory" ]] || die "VM '$name' already exists at $target_directory"
+  validate_runtime_paths "$name"
+
+  prepare_identity "$identity"
+
+  if [[ -n "$source_image" ]]; then
+    [[ -f "$source_image" ]] || die "image not found: $source_image"
+    source_image=$(absolute_path "$source_image") || die "could not resolve image path"
+  else
+    download_base_image
+    source_image="$BASE_IMAGE_PATH"
+  fi
+
+  mkdir -p "$vms_directory"
+  chmod 700 "$vms_directory"
+  STAGE_DIRECTORY=$(mktemp -d "$vms_directory/.${name}.XXXXXX")
+  trap cleanup_stage EXIT INT TERM
+
+  VM_NAME="$name"
+  CPUS="$cpus"
+  MEMORY_MB="$memory_mb"
+  DISK_SIZE="$disk_size"
+  SSH_PORT="$ssh_port"
+  GUEST_USER="$guest_user"
+
+  say "creating ${disk_size} VM disk"
+  cp "$source_image" "$STAGE_DIRECTORY/disk.qcow2"
+  qemu-img resize "$STAGE_DIRECTORY/disk.qcow2" "$disk_size" >/dev/null
+  cp "$FIRMWARE_VARS_TEMPLATE" "$STAGE_DIRECTORY/efi-vars.fd"
+
+  write_cloud_init "$STAGE_DIRECTORY" "$name" "$guest_user"
+  create_seed_image "$STAGE_DIRECTORY"
+  write_config "$STAGE_DIRECTORY"
+
+  mv "$STAGE_DIRECTORY" "$target_directory"
+  STAGE_DIRECTORY=""
+  trap - EXIT INT TERM
+
+  say "VM '$name' created"
+  say "start it with: msl-arm start $name"
+  say "then connect with: msl-arm ssh $name"
+}
+
+load_config() {
+  local name="$1"
+  local file
+  local key
+  local value
+
+  file=$(config_path "$name")
+  [[ -f "$file" ]] || die "VM '$name' does not exist (missing $file)"
+
+  NAME=""
+  CPUS=""
+  MEMORY_MB=""
+  DISK_SIZE=""
+  SSH_PORT=""
+  GUEST_USER=""
+  IDENTITY_FILE=""
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      NAME) NAME="$value" ;;
+      CPUS) CPUS="$value" ;;
+      MEMORY_MB) MEMORY_MB="$value" ;;
+      DISK_SIZE) DISK_SIZE="$value" ;;
+      SSH_PORT) SSH_PORT="$value" ;;
+      GUEST_USER) GUEST_USER="$value" ;;
+      IDENTITY_FILE) IDENTITY_FILE="$value" ;;
+      ''|'#'*) ;;
+      *) die "unknown key '$key' in $file" ;;
+    esac
+  done <"$file"
+
+  [[ "$NAME" == "$name" ]] || die "config NAME does not match VM directory"
+  validate_vm_name "$NAME"
+  validate_integer_range "CPU count" "$CPUS" "1" "64"
+  validate_integer_range "memory" "$MEMORY_MB" "512" "1048576"
+  validate_disk_size "$DISK_SIZE"
+  validate_port "$SSH_PORT"
+  validate_guest_user "$GUEST_USER"
+  [[ -n "$IDENTITY_FILE" ]] || die "IDENTITY_FILE is missing from $file"
+}
+
+runtime_file() {
+  printf '%s/%s\n' "$(vm_directory "$1")" "$2"
+}
+
+validate_runtime_paths() {
+  local name="$1"
+  local socket_path
+  local LC_ALL=C
+
+  for socket_path in \
+    "$(runtime_file "$name" "monitor.sock")" \
+    "$(runtime_file "$name" "serial.sock")"; do
+    ((${#socket_path} <= 100)) ||
+      die "Unix socket path is too long; choose a shorter VM name or --home directory"
+  done
+}
+
+read_vm_pid() {
+  local pid_file
+  pid_file=$(runtime_file "$1" "qemu.pid")
+  [[ -f "$pid_file" ]] || return 1
+  VM_PID=$(sed -n '1p' "$pid_file")
+  [[ "$VM_PID" =~ ^[0-9]+$ ]] || return 1
+}
+
+vm_is_running() {
+  local name="$1"
+  local process_command
+
+  read_vm_pid "$name" || return 1
+  kill -0 "$VM_PID" 2>/dev/null || return 1
+  process_command=$(ps -ww -p "$VM_PID" -o command= 2>/dev/null || true)
+  [[ "$process_command" == *qemu-system-aarch64* && "$process_command" == *"-name msl-arm-${name} "* ]]
+}
+
+cleanup_runtime_files() {
+  local directory
+  directory=$(vm_directory "$1")
+  rm -f "$directory/qemu.pid" "$directory/monitor.sock" "$directory/serial.sock"
+}
+
+build_qemu_args() {
+  local name="$1"
+  local directory
+  local qemu_binary
+
+  directory=$(vm_directory "$name")
+  qemu_binary=$(command -v qemu-system-aarch64) ||
+    die "qemu-system-aarch64 not found; run: brew install qemu"
+  find_firmware || die "QEMU AArch64 UEFI firmware not found; run: brew install qemu"
+  [[ -f "$directory/disk.qcow2" ]] || die "missing VM disk: $directory/disk.qcow2"
+  [[ -f "$directory/efi-vars.fd" ]] || die "missing UEFI variable store"
+  [[ -f "$directory/seed.iso" ]] || die "missing cloud-init seed image"
+
+  QEMU_BINARY="$qemu_binary"
+  QEMU_ARGS=(
+    -name "msl-arm-${name}"
+    -machine "virt,accel=hvf,highmem=on"
+    -cpu host
+    -smp "$CPUS"
+    -m "$MEMORY_MB"
+    -drive "if=pflash,format=raw,readonly=on,file=${FIRMWARE_CODE}"
+    -drive "if=pflash,format=raw,file=${directory}/efi-vars.fd"
+    -drive "if=none,file=${directory}/disk.qcow2,format=qcow2,id=hd0,discard=unmap"
+    -device "virtio-blk-pci,drive=hd0,bootindex=1"
+    -drive "if=none,file=${directory}/seed.iso,format=raw,readonly=on,id=seed"
+    -device "virtio-blk-pci,drive=seed"
+    -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22"
+    -device "virtio-net-pci,netdev=net0"
+    -device virtio-rng-pci
+    -pidfile "${directory}/qemu.pid"
+    -monitor "unix:${directory}/monitor.sock,server=on,wait=off"
+  )
+}
+
+print_qemu_command() {
+  printf '%q ' "$QEMU_BINARY" "${QEMU_ARGS[@]}"
+  printf '\n'
+}
+
+cmd_command() {
+  parse_optional_name "$@"
+  load_config "$PARSED_NAME"
+  build_qemu_args "$PARSED_NAME"
+  QEMU_ARGS+=(-nographic)
+  print_qemu_command
+}
+
+cmd_start() {
+  local name="$DEFAULT_VM_NAME"
+  local detach="0"
+  local exit_status
+
+  if (($# > 0)) && [[ "$1" != --* ]]; then
+    name="$1"
+    shift
+  fi
+  while (($# > 0)); do
+    case "$1" in
+      --detach|-d) detach="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown start option: $1" ;;
+    esac
+  done
+
+  validate_vm_name "$name"
+  assert_supported_host
+  load_config "$name"
+  if vm_is_running "$name"; then
+    die "VM '$name' is already running with PID $VM_PID"
+  fi
+  cleanup_runtime_files "$name"
+  validate_runtime_paths "$name"
+  build_qemu_args "$name"
+
+  if [[ "$detach" == "1" ]]; then
+    QEMU_ARGS+=(
+      -daemonize
+      -display none
+      -serial "unix:$(runtime_file "$name" "serial.sock"),server=on,wait=off"
+    )
+    say "starting VM '$name' in the background"
+    "$QEMU_BINARY" "${QEMU_ARGS[@]}"
+    if vm_is_running "$name"; then
+      say "VM '$name' is running with PID $VM_PID"
+      say "console: msl-arm console $name"
+      say "SSH may take a minute on first boot: msl-arm ssh $name"
+    else
+      die "QEMU exited before writing a valid PID file"
+    fi
+    return 0
+  fi
+
+  QEMU_ARGS+=(-nographic)
+  say "starting VM '$name' (QEMU escape: Control-A X)"
+  set +e
+  "$QEMU_BINARY" "${QEMU_ARGS[@]}"
+  exit_status=$?
+  set -e
+  cleanup_runtime_files "$name"
+  return "$exit_status"
+}
+
+cmd_console() {
+  parse_optional_name "$@"
+  load_config "$PARSED_NAME"
+  vm_is_running "$PARSED_NAME" || die "VM '$PARSED_NAME' is not running"
+  require_command nc
+  [[ -S "$(runtime_file "$PARSED_NAME" "serial.sock")" ]] ||
+    die "serial socket is unavailable; the VM may be running in foreground mode"
+  say "attaching to '$PARSED_NAME' (Control-C detaches; the VM keeps running)"
+  nc -U "$(runtime_file "$PARSED_NAME" "serial.sock")"
+}
+
+cmd_ssh() {
+  local name="$DEFAULT_VM_NAME"
+
+  if (($# > 0)) && [[ "$1" != --* ]]; then
+    name="$1"
+    shift
+  fi
+  if (($# > 0)) && [[ "$1" == "--" ]]; then
+    shift
+  fi
+
+  validate_vm_name "$name"
+  load_config "$name"
+  require_command ssh
+  vm_is_running "$name" || die "VM '$name' is not running"
+  [[ -f "$IDENTITY_FILE" ]] || die "SSH private key not found: $IDENTITY_FILE"
+
+  exec ssh \
+    -i "$IDENTITY_FILE" \
+    -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=accept-new \
+    -o "UserKnownHostsFile=$(runtime_file "$name" "known_hosts")" \
+    -p "$SSH_PORT" \
+    "${GUEST_USER}@127.0.0.1" \
+    "$@"
+}
+
+cmd_stop() {
+  parse_optional_name "$@"
+  load_config "$PARSED_NAME"
+
+  if ! vm_is_running "$PARSED_NAME"; then
+    cleanup_runtime_files "$PARSED_NAME"
+    say "VM '$PARSED_NAME' is stopped"
+    return 0
+  fi
+
+  if command_exists nc && [[ -S "$(runtime_file "$PARSED_NAME" "monitor.sock")" ]]; then
+    say "requesting a graceful shutdown for '$PARSED_NAME'"
+    set +e
+    printf 'system_powerdown\n' | nc -w 1 -U "$(runtime_file "$PARSED_NAME" "monitor.sock")" >/dev/null 2>&1
+    set -e
+  else
+    warn "monitor socket unavailable; sending SIGTERM to QEMU PID $VM_PID"
+    kill -TERM "$VM_PID"
+  fi
+
+  for _ in {1..30}; do
+    if ! kill -0 "$VM_PID" 2>/dev/null; then
+      cleanup_runtime_files "$PARSED_NAME"
+      say "VM '$PARSED_NAME' stopped"
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  warn "VM is still running; shut down inside the guest or stop PID $VM_PID manually"
+  return 1
+}
+
+cmd_status() {
+  parse_optional_name "$@"
+  load_config "$PARSED_NAME"
+  if vm_is_running "$PARSED_NAME"; then
+    printf '%s: running (PID %s, SSH 127.0.0.1:%s)\n' "$PARSED_NAME" "$VM_PID" "$SSH_PORT"
+  else
+    printf '%s: stopped\n' "$PARSED_NAME"
+    return 1
+  fi
+}
+
+cmd_list() {
+  local vms_directory="$MSL_ARM_HOME/vms"
+  local directory
+  local found="0"
+  local name
+
+  (($# == 0)) || die "list does not accept arguments"
+
+  [[ -d "$vms_directory" ]] || return 0
+  for directory in "$vms_directory"/*; do
+    [[ -d "$directory" && -f "$directory/config" ]] || continue
+    found="1"
+    name=$(basename "$directory")
+    if vm_is_running "$name"; then
+      printf '%-24s running (PID %s)\n' "$name" "$VM_PID"
+    else
+      printf '%-24s stopped\n' "$name"
+    fi
+  done
+  [[ "$found" == "1" ]] || return 0
+}
+
+cmd_config() {
+  parse_optional_name "$@"
+  load_config "$PARSED_NAME"
+  cat "$(config_path "$PARSED_NAME")"
+}
+
+main() {
+  local command_name=""
+
+  while (($# > 0)); do
+    case "$1" in
+      --home)
+        [[ $# -ge 2 ]] || die "--home requires a directory"
+        MSL_ARM_HOME="$2"
+        shift 2
+        ;;
+      --version|-V)
+        printf 'msl-arm %s\n' "$VERSION"
+        return 0
+        ;;
+      --help|-h)
+        usage
+        return 0
+        ;;
+      *)
+        command_name="$1"
+        shift
+        break
+        ;;
+    esac
+  done
+
+  normalize_home
+
+  case "$command_name" in
+    doctor) cmd_doctor "$@" ;;
+    init) cmd_init "$@" ;;
+    start) cmd_start "$@" ;;
+    console) cmd_console "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    stop) cmd_stop "$@" ;;
+    status) cmd_status "$@" ;;
+    list) cmd_list "$@" ;;
+    command) cmd_command "$@" ;;
+    config) cmd_config "$@" ;;
+    help|'') usage ;;
+    *) die "unknown command: $command_name" ;;
+  esac
+}
+
+main "$@"
