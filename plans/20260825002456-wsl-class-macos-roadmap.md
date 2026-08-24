@@ -4,6 +4,7 @@
 - Ngày: 2026-08-25
 - Đối tượng: maintainer, contributor và người kiểm thử MSL
 - Phạm vi mục tiêu: chỉ Mac Apple Silicon; terminal, Linux GUI và linux/amd64 qua Rosetta 2
+- Nhánh phát triển: `next`; MVP trước khi tách được giữ ở `main` và thư mục `legacy/`
 
 ## Tóm tắt quyết định
 
@@ -21,6 +22,16 @@ Kiến trúc được khuyến nghị:
 8. Giữ QEMU/HVF chỉ để đọc/chạy VM cũ và migration; không yêu cầu parity WSLg/Rosetta trên backend này.
 
 Không fork toàn bộ WSLg hoặc tự viết hypervisor. MSL tái sử dụng Weston/XWayland/FreeRDP/PipeWire ở guest và framework ảo hóa của Apple; phần riêng của MSL là control plane, guest contract và host integration native macOS.
+
+## Chiến lược repository và nhánh
+
+- `main` giữ snapshot MVP đã có SwiftUI Settings, Apple Container Machine và QEMU/HVF trước khi bắt đầu kiến trúc mới.
+- `next` là nhánh tích hợp cho roadmap này. README ở root mô tả product target và phase gate, không quảng cáo runtime chưa tồn tại là đã sử dụng được.
+- `legacy/` trên `next` chứa nguyên implementation, build scripts, tests và tài liệu MVP cũ. Lịch sử file được giữ bằng rename; khu vực này chỉ nhận security, data-safety hoặc migration fix.
+- Code thế hệ mới sẽ xuất hiện ở root theo boundary `CLI/`, `Daemon/`, `Runtime/`, `Host/`, `Guest/` và `tests/`; không copy dần code legacy trở lại nếu chưa có contract rõ.
+- Mỗi phase phát triển trên feature branch ngắn, merge vào `next` sau exit gate. Chỉ fast-forward/merge `next` vào `main` khi release train tương ứng đạt Definition of Done.
+
+Việc tách nhánh không phải migration dữ liệu người dùng. Mọi tool/bundle cũ phải tiếp tục build và test từ `legacy/` cho đến khi có migration tooling được release và xác minh rollback.
 
 ## Bối cảnh và bằng chứng
 
@@ -315,6 +326,7 @@ Mục tiêu: khóa product semantics trước khi thay kiến trúc.
 
 - Viết domain model distro, lifecycle state machine, error taxonomy và capability matrix.
 - Chốt CLI UX, config precedence và XPC schema v1.
+- Ghi contract frozen của `legacy/`, fixture hóa state/disk metadata cần migration và định nghĩa compatibility window trước khi tạo code mới.
 - Tạo benchmark harness cho list, warm exec, cold shell, shared/ext4 I/O và idle memory.
 - Spike MSLg transport: kiểm chứng per-window remoting, clipboard, HiDPI và input bằng RDP RAIL/FreeRDP trên macOS; ghi rõ tiêu chí chuyển sang AppKit/Metal bridge tối thiểu nếu upstream không đạt.
 - Spike persistent Rosetta: dựng ARM64 VM mẫu bằng API public, attach `VZLinuxRosettaDirectoryShare`, mount read-only và chạy executable x86_64 qua `binfmt_misc`.
@@ -418,6 +430,8 @@ Exit gate: không còn P0/P1, data-integrity suite pass, performance budget pass
 
 | Khu vực | Hướng thay đổi |
 | --- | --- |
+| `README.md` | Product target, branch policy, phase order và cảnh báo trạng thái chưa có runtime mới |
+| `legacy` | Snapshot MVP frozen; build/test độc lập và chỉ nhận security/data-safety/migration fix |
 | `App/MSLSettings` | Giữ SwiftUI; thay direct runtime client bằng XPC client và shared models |
 | `App/MSLSettings/Sources/MSLControlCore` | Tách thành core package độc lập UI, thêm state machine và capability model |
 | `Daemon/MSLD` | LaunchAgent, XPC service, operation journal, runtime orchestration |
@@ -437,6 +451,7 @@ Tên thư mục mới là đề xuất và có thể đổi trong Phase 0, nhưn
 
 ### Mỗi pull request
 
+- Nếu chạm `legacy/`, chạy lại lint/test bằng entrypoint trong thư mục đó và chứng minh không phá compatibility baseline.
 - Swift unit tests, strict concurrency, shell lint và schema compatibility.
 - Fake runtime contract tests cho mọi error/timeout/cancel path.
 - Fake graphical/Rosetta capability tests, gồm host không hỗ trợ và partial failure.
@@ -474,6 +489,7 @@ Tên thư mục mới là đề xuất và có thể đổi trong Phase 0, nhưn
 | Không có đường GPU Linux-to-Metal public đủ ổn định | Ship software-rendering baseline; chỉ bật acceleration sau security, license, correctness và performance gate |
 | Rosetta availability, license hoặc API đổi theo macOS | Probe runtime, yêu cầu Apple installer khi phù hợp, không redistribute artifact và giữ ARM64 distro hoạt động khi capability tắt |
 | MSLg system distro upgrade làm hỏng GUI | Image read-only, pin version theo host, health check trước switch và rollback một version |
+| Legacy và runtime mới drift hoặc bị nhập nhằng | Boundary thư mục/branch rõ, capability label trong UI, fixture migration và cấm feature mới trong `legacy/` |
 | Shared home chậm với workload nhiều file | Hai workspace mode, benchmark công khai, Linux-native là recommendation cho workload nặng |
 | First pull/build lâu | Prebuilt signed image, progress/resume, background prefetch sau consent |
 | Runtime thiếu snapshot/export | Không giả lập vội; capability gate và guest-coordinated consistency spike |
@@ -492,6 +508,7 @@ Tên thư mục mới là đề xuất và có thể đổi trong Phase 0, nhưn
 - Tự viết Linux syscall translation layer kiểu WSL 1.
 - Dùng private Apple API, bundle hoặc phân phối lại Rosetta artifact.
 - Tự viết hypervisor, CPU emulator hoặc fork toàn bộ WSLg khi framework/protocol upstream đáp ứng contract.
+- Tiếp tục mở rộng MVP trong `legacy/` thay cho việc xây contract/runtime mới ở root.
 
 ## Câu hỏi còn mở
 
