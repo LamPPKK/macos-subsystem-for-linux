@@ -1,4 +1,20 @@
-# Thiết kế msl-arm
+# Thiết kế MSL
+
+## Hai backend, một control plane
+
+MSL Settings là app SwiftUI quản lý cấu hình; terminal vẫn là data plane tương tác. Trên Apple Silicon + macOS 26, backend ưu tiên là Apple Container `container machine`. Backend này dùng OCI image và Virtualization.framework qua stack Containerization do Apple cung cấp.
+
+```text
+MSL Settings
+  ├─ Process -> container machine (persistent OCI Linux environment)
+  │              └─ Apple Containerization -> Virtualization.framework
+  └─ Process -> msl-arm (legacy/compatibility)
+                 └─ QEMU -> HVF -> Debian ARM64 qcow2
+```
+
+App dùng machine-readable JSON của `container machine list/inspect`, không parse table. Các thay đổi cấu hình gọi `container machine set`; login shell gọi `container machine run` và được mở bằng Terminal. QEMU state được giữ tách biệt và không tự convert sang storage của Apple Container.
+
+Phần dưới mô tả backend QEMU/HVF ban đầu, hiện vẫn là compatibility path.
 
 ## Mục tiêu
 
