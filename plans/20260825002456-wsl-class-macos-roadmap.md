@@ -1,23 +1,26 @@
-# Kế hoạch MSL: Linux subsystem cấp độ WSL cho macOS
+# Kế hoạch MSL: Linux subsystem cấp độ WSL + WSLg cho macOS ARM
 
 - Trạng thái: Proposed
 - Ngày: 2026-08-25
 - Đối tượng: maintainer, contributor và người kiểm thử MSL
-- Phạm vi mục tiêu: Mac Apple Silicon, terminal-first, Apple Container Machine là runtime ưu tiên
+- Phạm vi mục tiêu: chỉ Mac Apple Silicon; terminal, Linux GUI và linux/amd64 qua Rosetta 2
 
 ## Tóm tắt quyết định
 
-MSL sẽ trở thành một Linux subsystem được quản lý, không phải một ứng dụng VM truyền thống. Người dùng cài một lần, gọi `msl` từ Terminal để vào distro mặc định, và chỉ mở MSL Settings khi muốn tạo distro, chỉnh tài nguyên hoặc chẩn đoán lỗi.
+MSL sẽ trở thành một Linux subsystem được quản lý, không phải một ứng dụng VM truyền thống. Người dùng cài một lần, gọi `msl` từ Terminal để vào distro mặc định, chạy ứng dụng Linux GUI như ứng dụng macOS và dùng Rosetta 2 khi cần chạy binary Linux `amd64` trong distro ARM64.
 
 Kiến trúc được khuyến nghị:
 
-1. Dùng Apple Container Machine làm runtime chính trên Apple Silicon và macOS 26 trở lên.
-2. Thêm một daemon theo user là `msld` làm control plane duy nhất cho CLI và GUI.
-3. Xây CLI `msl` với mental model gần WSL: install, list, run, exec, stop, shutdown, set-default, config, export, import và doctor.
-4. Giữ QEMU/HVF làm compatibility backend trong giai đoạn chuyển tiếp; không đầu tư thêm một VMM riêng trước khi có gap đã được benchmark và chứng minh.
-5. Tối ưu cho Terminal và developer workflow; Linux GUI/WSLg không thuộc v1.
+1. Chỉ hỗ trợ Apple Silicon. Không dành ngân sách phát triển cho Intel Mac hoặc x86 host.
+2. Dùng Apple Container Machine làm backend sớm cho terminal/distro lifecycle trên macOS 26 trở lên.
+3. Xây MSL Native Runtime trên Apple Containerization + Virtualization.framework cho các capability Apple Container Machine chưa expose: system distro kiểu WSLg, custom virtio channel và Rosetta trong distro persistent.
+4. Thêm một daemon theo user là `msld` làm control plane duy nhất cho CLI, GUI và graphical sessions.
+5. Xây CLI `msl` với mental model gần WSL: install, list, run, exec, stop, shutdown, set-default, config, export, import, mount, gui và doctor.
+6. Xây `MSLg` system distro read-only gồm Weston, XWayland và PipeWire; ánh xạ từng cửa sổ Linux thành cửa sổ macOS, kèm clipboard, audio, input, HiDPI và app discovery.
+7. Tích hợp Rosetta 2 theo hai tầng: workload OCI `amd64` bằng Apple Container ngay khi có thể, sau đó binary `amd64` bên trong distro ARM64 bằng `VZLinuxRosettaDirectoryShare` và `binfmt_misc`.
+8. Giữ QEMU/HVF chỉ để đọc/chạy VM cũ và migration; không yêu cầu parity WSLg/Rosetta trên backend này.
 
-Quyết định này ưu tiên độ mượt, độ an toàn dữ liệu và chi phí bảo trì thấp hơn việc hỗ trợ mọi phiên bản macOS ngay từ đầu.
+Không fork toàn bộ WSLg hoặc tự viết hypervisor. MSL tái sử dụng Weston/XWayland/FreeRDP/PipeWire ở guest và framework ảo hóa của Apple; phần riêng của MSL là control plane, guest contract và host integration native macOS.
 
 ## Bối cảnh và bằng chứng
 
@@ -45,11 +48,15 @@ MSL nên sao chép mental model này, không sao chép implementation Windows:
 - Linux kernel và systemd được runtime quản lý.
 - Host integration phải tiện, nhưng workspace hiệu năng cao cần nằm trên Linux filesystem.
 
+WSLg đạt trải nghiệm GUI liền mạch bằng một system distro tách khỏi user distro. System distro chạy Weston, XWayland và audio server; socket được project vào user distro. Weston dùng RDP backend/RAIL để remote từng cửa sổ thay vì cả desktop, còn host plugin phụ trách app list, icon, clipboard, audio và window lifecycle. MSL sẽ giữ boundary system-distro/user-distro này nhưng thay thành phần host Windows bằng client native AppKit/Metal/CoreAudio trên macOS.
+
 ### Điều Apple đã cung cấp
 
-Apple Container chạy OCI image trong lightweight Linux VM, tối ưu cho Apple silicon. Container Machine bổ sung đúng các primitive gần WSL: machine persistent, init system, user khớp host, home sharing, boot-on-run, nhiều distro, CPU/RAM config và lifecycle command. Containerization phía dưới đã có Virtualization.framework, ext4, optimized kernel, networking và guest control qua vsock.
+Apple Container chạy OCI image trong lightweight Linux VM, tối ưu cho Apple silicon. Container Machine bổ sung đúng các primitive gần WSL: machine persistent, init system, user khớp host, home sharing, boot-on-run, nhiều distro, CPU/RAM config và lifecycle command. Containerization phía dưới đã có Virtualization.framework, ext4, optimized kernel, networking, guest control qua vsock và Rosetta cho OCI workload `amd64`.
 
-Vì vậy, viết lại Virtualization.framework backend ngay sẽ trùng phần khó nhất mà Apple đã triển khai. MSL nên đặt stable product contract phía trên Apple Container và chỉ mở capability cho backend khác khi cần.
+Virtualization.framework hỗ trợ chạy binary Linux x86_64 trong ARM Linux bằng `VZLinuxRosettaDirectoryShare`; guest mount Rosetta share rồi đăng ký interpreter qua `binfmt_misc`. Apple nói rõ đây không phải cơ chế boot một distro/kernel Intel. Trên macOS 26 trở xuống có bước cài Rosetta; tài liệu hiện tại cho biết macOS 27 tích hợp trực tiếp Intel translation cho Linux app.
+
+Apple Container CLI hiện expose `--rosetta` cho container workload nhưng chưa expose Rosetta cho Container Machine persistent. Một issue upstream năm 2026 vẫn tái hiện `amd64` Container Machine thất bại với `Exec format error`. Vì WSLg và machine-wide Rosetta đều cần quyền cấu hình VM/device sâu hơn, MSL Native Runtime trở thành workstream bắt buộc; nó tái sử dụng Containerization/Virtualization.framework thay vì viết hypervisor từ đầu.
 
 ## Product promise
 
@@ -60,6 +67,9 @@ V1 phải tạo được trải nghiệm sau:
 - CLI và MSL Settings luôn thấy cùng state, cùng lỗi và cùng tiến trình operation.
 - Distro giữ nguyên package, service và file qua restart.
 - Project có thể chạy theo hai mode: shared workspace để tiện chỉnh sửa bằng app macOS, hoặc Linux-native workspace để tối đa I/O.
+- App Linux X11 và Wayland xuất hiện thành cửa sổ macOS riêng, có Dock/Command-Tab, clipboard, audio, input method và HiDPI.
+- Distro ARM64 có thể chạy binary Linux `amd64` bằng Rosetta 2 mà không cài một distro x86_64 riêng.
+- Ứng dụng GUI và Rosetta có capability detection; khi host/runtime chưa hỗ trợ, UI fail rõ ràng thay vì fallback âm thầm sang emulation chậm.
 - Stop, delete, update và import/export không được làm mất dữ liệu âm thầm.
 - Khi runtime hỏng, `msl doctor` trả về nguyên nhân và hành động khắc phục cụ thể.
 
@@ -76,6 +86,10 @@ Các giá trị sau là target cần được benchmark trên baseline M2, 16 GB
 | Daemon idle, không có distro chạy | không quá 150 MB resident memory |
 | Distro đã stop | không giữ guest RAM |
 | Operation UI dài | không block main thread; có progress và cancel khi runtime cho phép |
+| GUI app đầu tiên khi graphical service đã warm | p50 không quá 1 giây, p95 không quá 2 giây |
+| GUI app đầu tiên từ cold distro | p50 không quá 3 giây, p95 không quá 5 giây |
+| Local GUI input-to-present | p95 không quá 50 ms với workload 2D chuẩn |
+| Rosetta CLI workload sau warm-up | không chậm quá 2,5 lần so với binary ARM64 tương đương ở benchmark đã chọn |
 
 Không được tối ưu bằng cách giữ tất cả distro chạy vĩnh viễn. Chính sách warm/idle phải có giới hạn rõ ràng và người dùng có thể tắt.
 
@@ -85,7 +99,8 @@ Không được tối ưu bằng cách giữ tất cả distro chạy vĩnh vi�
 
 - `msl`: CLI chính, ưu tiên startup nhanh và output ổn định cho người lẫn automation.
 - MSL Settings: GUI native để install distro, cấu hình CPU/RAM/home, xem health/log, đặt default và quản lý storage.
-- Terminal: data plane tương tác duy nhất trong v1; app chỉ yêu cầu daemon mở phiên shell.
+- Terminal: data plane cho shell/TUI; app chỉ yêu cầu daemon mở phiên shell.
+- MSLg Host: process native quản lý cửa sổ Linux, input, clipboard, audio, notification, app icon và lifecycle graphical session.
 
 ### Control plane `msld`
 
@@ -108,11 +123,19 @@ Daemon không giữ shell tương tác trong XPC. Nó cấp session request; CLI
 
 `RuntimeBackend` trở thành protocol nội bộ với capability rõ ràng thay vì để UI gọi executable trực tiếp.
 
-- Apple Container Machine: backend production mặc định.
-- QEMU/HVF: read/launch compatibility cho VM hiện có; deprecate dần sau khi có migration an toàn.
-- Virtualization.framework backend riêng: chỉ bắt đầu nếu benchmark hoặc product requirement chứng minh Apple Container không thể đáp ứng một capability bắt buộc. Đây không phải dependency của v1.
+- Apple Container Machine: backend Core Preview/terminal và compatibility; không còn là mặc định cho distro mới sau khi MSL Native Runtime vượt production gate.
+- MSL Native Runtime: backend production cho graphical session và persistent Rosetta, xây trên Apple Containerization + Virtualization.framework; không tự viết CPU emulator hay hypervisor.
+- QEMU/HVF: read/launch compatibility cho VM hiện có; deprecate dần sau khi có migration an toàn và không nhận feature WSLg/Rosetta mới.
 
 Mọi call đến CLI ngoài phải dùng argument array, tách stdout/stderr, timeout, cancellation và version probe. Không parse table nếu JSON/machine-readable format có sẵn.
+
+### Chuyển đổi backend và bố trí system distro
+
+Core Preview được phép tạo distro bằng Apple Container Machine để đưa terminal workflow đến người dùng sớm. Sau Phase 3, MSL Native Runtime trở thành mặc định cho distro mới thuộc full profile. Backend là metadata hiển thị công khai; MSL không tự đổi backend của distro đang chạy hoặc hứa dùng chung disk format giữa hai runtime.
+
+Migration Apple Container → MSL Native Runtime là transaction copy-and-verify: quiesce guest, tạo archive/manifest/checksum, restore sang disk mới, boot compatibility suite, rồi mới cho người dùng chuyển default. Source distro được giữ nguyên cho đến khi người dùng xác nhận xóa. Nếu consistency primitive chưa đủ an toàn, distro cũ tiếp tục terminal-only thay vì nhận WSLg/Rosetta bằng workaround không bảo đảm dữ liệu.
+
+Trên MSL Native Runtime, user distro và MSLg system image nằm trong cùng ARM64 VM để tránh thêm một lớp network/remoting giữa hai VM. System image là volume read-only, chạy service trong namespace riêng và chỉ project socket/metadata đã định nghĩa vào user environment. Một system image version có thể được cache dùng chung trên host, nhưng state/session của từng distro vẫn tách biệt.
 
 ### Guest contract
 
@@ -126,8 +149,79 @@ Guest integration phụ trách:
 - service/port discovery tùy chọn;
 - shutdown acknowledgement;
 - version/capability report.
+- mount/project socket từ MSLg system distro vào user distro;
+- đăng ký Rosetta interpreter an toàn qua `binfmt_misc` khi capability được bật;
+- app discovery từ desktop entry và icon metadata;
+- session bus, locale, timezone, clipboard và GUI environment contract.
 
-Không dựa vào API vsock chưa được Apple công bố cho third party. Phase đầu dùng các entrypoint được Apple Container hỗ trợ công khai; transport khác chỉ được thêm sau capability spike.
+Apple Container backend chỉ dùng entrypoint công khai. MSL Native Runtime được phép dùng API public của Containerization/Virtualization.framework và virtio socket do chính MSL cấu hình; không dựa vào private framework hoặc copy Rosetta binary ra khỏi share do Apple quản lý.
+
+## Ma trận tương thích WSL/WSLg mục tiêu
+
+| Nhóm capability | Mục tiêu MSL trên Apple Silicon | Milestone |
+| --- | --- | --- |
+| Linux kernel thật, syscall compatibility | ARM64 Linux VM, systemd, cgroup v2 | Core GA |
+| Distro lifecycle | install/list/default/run/exec/stop/shutdown/unregister | Core GA |
+| Custom distro | OCI/rootfs import, signed catalog, default user | Core GA |
+| Export/import | archive có quiesce, manifest, checksum và restore verification | Portability GA |
+| Resource config | CPU, RAM, disk policy, idle shutdown, memory pressure | Core GA |
+| File interop | shared macOS workspace + Linux-native high-performance workspace | Core GA |
+| Path/command interop | cwd translation, `open`/clipboard helper, exit-code/signal parity | Integration GA |
+| Network | localhost, stable hostname, IPv4/IPv6, DNS/proxy, explicit expose | Integration GA |
+| systemd services | boot/shutdown đúng lifecycle; background policy rõ | Core GA |
+| Linux GUI X11 | XWayland trong MSLg system distro, cửa sổ macOS riêng | MSLg GA |
+| Linux GUI Wayland | Weston compositor, per-window remoting | MSLg GA |
+| Audio/microphone | PipeWire bridge sang CoreAudio, permission theo app | MSLg GA |
+| Clipboard/notification | NSPasteboard/UserNotifications bridge hai chiều | MSLg GA |
+| App discovery | desktop entry thành launcher/Dock/Spotlight item có icon | MSLg GA |
+| HiDPI/multi-display/input | scale, keyboard layout, IME, pointer, accessibility smoke | MSLg GA |
+| GPU acceleration | capability spike; software/CPU rendering là fallback có cảnh báo | Post-beta gate |
+| Linux `amd64` app | Rosetta 2 trong ARM64 distro, không boot x86 kernel | Rosetta GA |
+| OCI `amd64` workload | Apple Container `--rosetta` lane | Core beta |
+| Nested virtualization | M3+ và custom KVM kernel theo capability Apple | Advanced |
+| USB/device attach | USB/IP hoặc VZ device API sau security/driver spike | Advanced |
+| Full Linux desktop | optional desktop window; không thay per-app default | Advanced |
+
+“Tương thích” ở đây là parity về user journey và capability. MSL không hứa binary/API compatibility với `wsl.exe`, VHDX, DirectX hoặc Windows registry.
+
+## MSLg: Linux GUI trên macOS
+
+### Guest graphical system distro
+
+Mỗi user distro được ghép với một MSLg system image read-only, versioned cùng host app và gắn vào cùng VM. Nó chứa Weston, XWayland, PipeWire và MSLg agent. Socket Wayland/X11/audio được project vào user distro; người dùng không cài hoặc sửa system image. Update thay image và luôn có rollback một version.
+
+Weston quản lý Wayland và XWayland. Backend remoting ưu tiên RDP RAIL/FreeRDP nếu spike xác nhận macOS client đạt per-window, clipboard và HiDPI requirements. Nếu upstream macOS client không đủ, MSL xây host bridge tối thiểu bằng AppKit/Metal quanh protocol đã chọn; full-desktop RDP/XQuartz chỉ là fallback phát triển, không phải Definition of Done.
+
+### Host integration
+
+- Mỗi Linux surface map thành một `NSWindow`; close/minimize/focus/resize đồng bộ hai chiều.
+- `.desktop` và icon được agent gửi lên host; launcher gọi distro + app ID ổn định.
+- Clipboard dùng MIME-aware bridge, giới hạn kích thước và yêu cầu consent cho file transfer.
+- PipeWire audio map sang CoreAudio; microphone đi qua permission macOS và mặc định tắt.
+- Keyboard layout, dead key, IME, pointer capture, multi-display và fractional scale có contract test riêng.
+- Graphical session warm độc lập với user app và tự restart khi compositor crash; app user không được phép sửa system distro.
+
+### GPU policy
+
+WSLg trên Windows dùng vGPU/DirectX; macOS không cung cấp một API tương đương có thể mặc định coi là sẵn cho Linux guest. MSLg beta phải chạy đúng bằng software rendering trước. GPU/Metal acceleration chỉ ship sau spike chứng minh API public, license phù hợp, correctness và performance; không quảng cáo parity GPU trước khi có benchmark thật.
+
+## Rosetta 2 trong Linux
+
+### Contract hỗ trợ
+
+- Host chỉ là Apple Silicon.
+- Guest vẫn là ARM64 Linux; Rosetta dịch executable/user-space library x86_64.
+- Không boot kernel/distro x86_64 và không dùng Rosetta cho kernel module.
+- `msl exec --arch amd64` chọn Intel translation; `auto` đọc ELF architecture và chỉ dùng Rosetta khi cần.
+- Distro config có `rosetta = auto|enabled|disabled`; default là `auto` sau khi người dùng đồng ý cài component Apple trên macOS 26 trở xuống.
+
+### Hai giai đoạn
+
+Giai đoạn A dùng Apple Container `container run --rosetta --arch amd64` cho OCI workload tạm thời. Đây là capability chính thức nhưng không cung cấp persistent machine semantics.
+
+Giai đoạn B dùng MSL Native Runtime: host kiểm `VZLinuxRosettaDirectoryShare.availability`, yêu cầu Apple installer khi cần, attach share `virtiofs` vào ARM64 VM, guest mount read-only và đăng ký binary handler qua `binfmt_misc`. AOT cache dùng option public của Virtualization.framework khi có; cache có quota và bị xóa an toàn.
+
+MSL không tải, bundle, copy hoặc chỉnh sửa Rosetta runtime. Nếu Apple đổi availability/license/API, capability bị disable với actionable error; distro ARM64 vẫn hoạt động bình thường.
 
 ## Distro, image và storage
 
@@ -202,6 +296,9 @@ Nhóm lệnh v1:
 - `msl install`: cài distro từ catalog hoặc OCI reference.
 - `msl list`: liệt kê distro, state, backend và default.
 - `msl run` và `msl exec`: mở interactive shell hoặc chạy command.
+- `msl exec --arch arm64|amd64|auto`: chọn kiến trúc executable; `amd64` chỉ chạy khi Rosetta capability sẵn sàng.
+- `msl gui`: liệt kê hoặc mở Linux GUI app qua MSLg session của distro.
+- `msl mount`: quản lý workspace/share được cấp quyền, không tự động expose toàn bộ filesystem macOS.
 - `msl stop`, `msl shutdown`: dừng một distro hoặc toàn bộ.
 - `msl set-default`: đổi distro mặc định.
 - `msl config`: đọc/ghi CPU, memory, workspace, idle timeout và exposed ports.
@@ -219,9 +316,11 @@ Mục tiêu: khóa product semantics trước khi thay kiến trúc.
 - Viết domain model distro, lifecycle state machine, error taxonomy và capability matrix.
 - Chốt CLI UX, config precedence và XPC schema v1.
 - Tạo benchmark harness cho list, warm exec, cold shell, shared/ext4 I/O và idle memory.
+- Spike MSLg transport: kiểm chứng per-window remoting, clipboard, HiDPI và input bằng RDP RAIL/FreeRDP trên macOS; ghi rõ tiêu chí chuyển sang AppKit/Metal bridge tối thiểu nếu upstream không đạt.
+- Spike persistent Rosetta: dựng ARM64 VM mẫu bằng API public, attach `VZLinuxRosettaDirectoryShare`, mount read-only và chạy executable x86_64 qua `binfmt_misc`.
 - Ghi baseline trên ít nhất M1 8 GB, M2 16 GB và M3; dùng macOS 26 release hiện hành.
 
-Exit gate: benchmark reproducible, lifecycle invariants được review, không còn câu hỏi chặn thiết kế daemon.
+Exit gate: benchmark reproducible, lifecycle invariants được review, chọn được graphical transport, persistent Rosetta chạy được trên ít nhất một baseline và không còn câu hỏi chặn thiết kế daemon/runtime.
 
 ### Phase 1 — Shared core, CLI `msl` và daemon `msld`
 
@@ -234,7 +333,7 @@ Mục tiêu: một control plane cho mọi frontend.
 
 Exit gate: CLI và GUI luôn đồng bộ state; daemon restart giữa create/stop không làm hỏng distro; list đạt SLO.
 
-### Phase 2 — Golden Ubuntu và lifecycle production
+### Phase 2 — Golden Ubuntu và Core Preview
 
 Mục tiêu: install-to-shell một bước.
 
@@ -243,9 +342,23 @@ Mục tiêu: install-to-shell một bước.
 - Thêm image progress, retry/resume, version probe và actionable doctor.
 - Bảo toàn QEMU VM hiện có ở compatibility view.
 
-Exit gate: fresh machine đi từ installer đến shell không cần QEMU/Homebrew; cold/warm targets đạt trên baseline hoặc có accepted exception kèm số liệu.
+Exit gate: fresh machine đi từ installer đến shell không cần QEMU/Homebrew; cold/warm targets đạt trên baseline hoặc có accepted exception kèm số liệu; UI ghi rõ đây là terminal profile nếu backend chưa có WSLg/Rosetta persistent.
 
-### Phase 3 — Terminal, workspace và localhost integration
+### Phase 3 — MSL Native Runtime và persistent Rosetta
+
+Mục tiêu: có backend production do MSL kiểm soát đủ sâu cho graphical device và Intel translation, nhưng vẫn chỉ dùng framework public của Apple.
+
+- Đóng gói Containerization/Virtualization.framework sau `RuntimeBackend`; không để frontend phụ thuộc API VM.
+- Quản lý kernel, initrd, ext4, boot configuration, vsock/virtiofs, resource policy và lifecycle bằng manifest versioned.
+- Attach Rosetta directory share khi config cho phép; guest mount read-only, đăng ký `binfmt_misc` và report capability về daemon.
+- Thêm capability gate theo host OS, Rosetta availability và runtime version; ARM64 distro vẫn boot bình thường nếu Rosetta không sẵn sàng.
+- Xác minh license boundary: không bundle, export hoặc copy Rosetta artifact; chỉ gọi installer/API do Apple cung cấp.
+- Xây migration copy-and-verify từ Apple Container backend, có preflight dung lượng, checksum, compatibility boot và rollback về source distro.
+- Chuyển default cho distro mới sang MSL Native Runtime chỉ sau khi lifecycle, recovery và migration gate cùng pass.
+
+Exit gate: distro ARM64 persistent chạy được cùng một test workload ở bản ARM64 và x86_64; disable/unavailable path không làm hỏng distro; update runtime có rollback và không mất disk.
+
+### Phase 4 — Terminal, workspace và localhost integration
 
 Mục tiêu: developer workflow hằng ngày không có “VM friction”.
 
@@ -256,7 +369,19 @@ Mục tiêu: developer workflow hằng ngày không có “VM friction”.
 
 Exit gate: compatibility suite cho shell phổ biến, benchmark filesystem công bố, service trong guest truy cập được qua localhost mapping sau restart.
 
-### Phase 4 — GUI production và release pipeline
+### Phase 5 — MSLg system distro và per-window host bridge
+
+Mục tiêu: Linux X11/Wayland app xuất hiện như app macOS riêng, không buộc người dùng mở cả Linux desktop.
+
+- Build system distro read-only, reproducible và versioned chứa Weston, XWayland, PipeWire và MSLg agent.
+- Project socket Wayland/X11/audio có kiểm soát vào user distro; app discovery đọc desktop entry/icon và gắn distro identity ổn định.
+- Xây MSLg Host cho window lifecycle, Dock/Command-Tab, clipboard, CoreAudio/microphone, keyboard/IME, pointer và notifications.
+- Ship software-rendering correctness baseline; giữ GPU/Metal acceleration sau capability spike và benchmark.
+- Thêm health/restart/rollback cho compositor, audio service và system distro mà không đụng dữ liệu user distro.
+
+Exit gate: bộ app GTK, Qt và Electron ở cả Wayland/X11 mở thành cửa sổ macOS riêng; clipboard/audio/input/HiDPI pass; compositor crash phục hồi mà không restart hoặc corrupt user distro.
+
+### Phase 6 — GUI Settings production và release pipeline
 
 Mục tiêu: MSL Settings đủ chất lượng phân phối.
 
@@ -266,23 +391,25 @@ Mục tiêu: MSL Settings đủ chất lượng phân phối.
 
 Exit gate: app qua accessibility checklist, upgrade từ hai version trước giữ nguyên distro, Gatekeeper chấp nhận clean install.
 
-### Phase 5 — Portability và ecosystem
+### Phase 7 — Portability, device và ecosystem
 
 Mục tiêu: import/export an toàn và nhiều distro.
 
 - Hoàn tất export/import sau consistency spike.
 - Thêm Debian và custom image validation profile.
 - IDE hooks, dotfiles bootstrap và optional container engine inside distro.
-- Đánh giá lại native Virtualization.framework backend dựa trên gap/benchmark thực tế.
+- Đánh giá USB/device attach, nested virtualization trên chip hỗ trợ và optional full-desktop mode qua capability/security spike riêng.
 
 Exit gate: restore test bit-for-bit ở scope đã cam kết, failure injection không làm mất source distro, custom image lỗi bị chặn trước create.
 
-### Phase 6 — GA hardening
+### Phase 8 — GA hardening
 
 Mục tiêu: độ tin cậy đủ cho daily driver.
 
 - Soak test nhiều ngày, memory/disk pressure, sleep/wake, network changes và abrupt reboot.
 - Upgrade/downgrade matrix cho macOS, Apple Container, MSL và guest image.
+- Soak graphical sessions nhiều cửa sổ/distro, compositor/audio crash và display hot-plug.
+- Chạy Rosetta compatibility/performance matrix trên macOS 26 và các release mới hơn còn được hỗ trợ.
 - Security review, threat model, recovery runbook và support bundle redaction.
 
 Exit gate: không còn P0/P1, data-integrity suite pass, performance budget pass và release rollback đã diễn tập.
@@ -295,9 +422,12 @@ Exit gate: không còn P0/P1, data-integrity suite pass, performance budget pass
 | `App/MSLSettings/Sources/MSLControlCore` | Tách thành core package độc lập UI, thêm state machine và capability model |
 | `Daemon/MSLD` | LaunchAgent, XPC service, operation journal, runtime orchestration |
 | `CLI/MSL` | CLI nhanh, TTY/session handling, JSON schema |
-| `Guest` | guest integration package, readiness và compatibility contract |
-| `images` | reproducible image build, pinned inputs, provenance và SBOM |
-| `tests` | contract, integration, failure injection, performance và upgrade matrix |
+| `Runtime/MSLNative` | Adapter Containerization/Virtualization.framework, persistent VM, virtio/vsock và Rosetta device configuration |
+| `Host/MSLgHost` | AppKit/Metal window bridge, CoreAudio, clipboard, input, app discovery và graphical lifecycle |
+| `Guest/MSLgSystem` | System distro read-only chứa Weston, XWayland, PipeWire và MSLg agent |
+| `Guest` | user-distro integration, readiness, socket projection, `binfmt_misc`, app discovery và compatibility contract |
+| `images` | reproducible user/system image build, pinned inputs, provenance, SBOM và rollback metadata |
+| `tests` | contract, integration, graphical, Rosetta, failure injection, performance và upgrade matrix |
 | `scripts`/release | signing, notarization, update feed và artifact verification |
 | `bin/msl-arm` | compatibility backend; đóng băng feature sau migration tooling |
 
@@ -309,6 +439,7 @@ Tên thư mục mới là đề xuất và có thể đổi trong Phase 0, nhưn
 
 - Swift unit tests, strict concurrency, shell lint và schema compatibility.
 - Fake runtime contract tests cho mọi error/timeout/cancel path.
+- Fake graphical/Rosetta capability tests, gồm host không hỗ trợ và partial failure.
 - Data mutation tests phải chứng minh target path và atomicity.
 - Benchmark smoke test với regression threshold rộng.
 
@@ -316,14 +447,19 @@ Tên thư mục mới là đề xuất và có thể đổi trong Phase 0, nhưn
 
 - Self-hosted Mac Apple Silicon chạy macOS 26 và Apple Container release được pin.
 - Install image, create, cold/warm exec, systemd service, stop/restart/delete.
+- MSL Native Runtime boot, readiness, virtiofs/vsock và Rosetta share trên host thật.
 - Shared workspace permissions, symlink, case sensitivity và large/small file workload.
 - Network mapping, sleep/wake, service restart và daemon crash recovery.
+- GUI suite với app GTK, Qt và Electron; Wayland/X11, nhiều cửa sổ/distro, clipboard, audio/microphone, HiDPI, multi-display, keyboard/IME và compositor crash recovery.
+- Rosetta suite chạy workload ARM64/x86_64 tương đương, kiểm availability/install flow, disabled path và xác nhận artifact Apple không bị copy vào bundle/distro/export.
 - Signed app install, first launch, update và rollback.
 
 ### Release gate
 
 - Test trên M1/M2/M3-or-newer và host RAM 8/16/32 GB.
 - Ít nhất 100 lifecycle loops mỗi baseline, 24 giờ soak và abrupt reboot recovery.
+- Software rendering là correctness baseline bắt buộc; GPU acceleration có release gate và benchmark riêng, không được dùng để che failure ở fallback.
+- MSLg system distro phải upgrade/rollback độc lập mà không đổi dữ liệu user distro.
 - Export/import test nếu feature được bật.
 - Không regression quá 10% ở p95 startup/exec so với release trước nếu không có waiver công khai.
 - Support bundle đã kiểm redaction; không chứa token, private key hoặc nội dung file người dùng.
@@ -333,24 +469,29 @@ Tên thư mục mới là đề xuất và có thể đổi trong Phase 0, nhưn
 | Rủi ro | Giảm thiểu |
 | --- | --- |
 | Apple Container command/JSON thay đổi | Version probe, adapter theo release, contract fixtures và pin minimum/maximum đã test |
-| macOS 26 giới hạn adoption | QEMU compatibility, nhưng product target vẫn ưu tiên macOS 26 để tránh kéo chậm core path |
+| Apple Container Machine không expose graphical device hoặc persistent Rosetta | Capability gate và MSL Native Runtime dùng Containerization/Virtualization.framework public; không phụ thuộc private API |
+| RDP RAIL/FreeRDP phía macOS không đạt per-window semantics | Phase 0 spike có exit criteria; fallback thiết kế là AppKit/Metal host bridge tối thiểu, không hạ DoD xuống full desktop |
+| Không có đường GPU Linux-to-Metal public đủ ổn định | Ship software-rendering baseline; chỉ bật acceleration sau security, license, correctness và performance gate |
+| Rosetta availability, license hoặc API đổi theo macOS | Probe runtime, yêu cầu Apple installer khi phù hợp, không redistribute artifact và giữ ARM64 distro hoạt động khi capability tắt |
+| MSLg system distro upgrade làm hỏng GUI | Image read-only, pin version theo host, health check trước switch và rollback một version |
 | Shared home chậm với workload nhiều file | Hai workspace mode, benchmark công khai, Linux-native là recommendation cho workload nặng |
 | First pull/build lâu | Prebuilt signed image, progress/resume, background prefetch sau consent |
 | Runtime thiếu snapshot/export | Không giả lập vội; capability gate và guest-coordinated consistency spike |
 | Daemon trở thành single point of failure | Journal, idempotent operations, reconcile runtime on launch và crash injection tests |
 | Xóa nhầm persistent storage | Typed destructive API, exact-name confirmation, backup gate và không dùng broad path deletion |
-| App chưa có distribution identity | Developer ID/notarization là blocker của Phase 4, không gọi ad-hoc bundle là production release |
+| App chưa có distribution identity | Developer ID/notarization là blocker của Phase 6, không gọi ad-hoc bundle là production release |
 | Trademark/kỳ vọng “WSL” | Dùng tên MSL; mô tả WSL-class experience, không tuyên bố binary/API compatibility với Microsoft WSL |
 
 ## Non-goals v1
 
-- Chạy Linux GUI app kiểu WSLg.
 - Hỗ trợ Intel Mac.
+- Boot kernel hoặc cả distro x86_64; Rosetta chỉ dịch Linux user-space executable trong guest ARM64.
 - Thay thế Docker Desktop hoặc trở thành Kubernetes distribution.
-- Binary compatibility với `wsl.exe` hay format VHDX.
+- Binary/API compatibility với `wsl.exe`, VHDX, Windows registry hoặc DirectX ABI.
 - Bridged/LAN networking mặc định.
 - Tự viết Linux syscall translation layer kiểu WSL 1.
-- Tự xây VMM riêng khi Apple Container vẫn đáp ứng product contract.
+- Dùng private Apple API, bundle hoặc phân phối lại Rosetta artifact.
+- Tự viết hypervisor, CPU emulator hoặc fork toàn bộ WSLg khi framework/protocol upstream đáp ứng contract.
 
 ## Câu hỏi còn mở
 
@@ -361,8 +502,13 @@ Tên thư mục mới là đề xuất và có thể đổi trong Phase 0, nhưn
 5. Linux-native workspace sẽ dùng remote editor nào làm golden path, hay chỉ cung cấp protocol-neutral SSH?
 6. Idle timeout mặc định nên là bao lâu trên máy 8 GB và 16 GB?
 7. Telemetry/crash reporting có được chấp nhận không; nếu có phải opt-in và self-hosted hay third-party?
+8. RDP RAIL/FreeRDP trên macOS có đáp ứng đủ per-window, clipboard, HiDPI và input không, hay phải dùng AppKit/Metal bridge?
+9. Có đường GPU acceleration public, ổn định và license-compatible nào cho Linux guest trên các macOS mục tiêu không?
+10. MSLg system distro sẽ được build/ký/phân phối thế nào để bảo toàn source provenance và license của Weston/XWayland/PipeWire?
+11. Ma trận hỗ trợ Rosetta giữa macOS 26, macOS 27 và các release tiếp theo cần policy cài đặt/availability khác nhau ra sao?
+12. USB/device attach nào thật sự cần cho developer workflow và có thể đáp ứng mà không thêm privileged helper quá rộng?
 
-Các câu 2–3 chặn public beta; câu 4 chặn stable export/import; các câu còn lại không chặn Phase 0–2.
+Các câu 2–3 chặn public beta; câu 4 chặn stable export/import; câu 8 và 10 chặn MSLg beta; câu 9 chặn GPU acceleration nhưng không chặn software-rendered MSLg; câu 11 chặn Rosetta GA. Các câu còn lại không chặn Phase 0–2.
 
 ## Definition of Done cho v1
 
@@ -377,17 +523,30 @@ V1 hoàn thành khi một người dùng trên Apple Silicon + macOS 26 có th�
 7. Stop/restart/update MSL mà không mất distro.
 8. Dùng doctor/support bundle để chẩn đoán lỗi mà không lộ secret.
 9. Quản lý cùng distro từ CLI và GUI với state nhất quán.
+10. Mở app Linux Wayland và X11 thành cửa sổ macOS riêng, có Dock/Command-Tab và lifecycle đúng.
+11. Dùng clipboard, audio, keyboard/IME, pointer và HiDPI trong Linux GUI app; microphone chỉ bật sau macOS consent.
+12. Chạy workload Linux x86_64 được chọn trong distro ARM64 bằng Rosetta, hoặc nhận actionable capability error nếu host không hỗ trợ.
+13. Update/rollback MSLg system distro mà không sửa hoặc làm mất dữ liệu user distro.
 
 Export/import không phải blocker v1 nếu Apple runtime chưa có consistency primitive phù hợp; feature phải được đánh dấu experimental hoặc hoãn thay vì ship không an toàn.
+
+Core GA có thể phát hành trước MSLg GA và Rosetta GA, nhưng product chỉ được mô tả là “WSL + WSLg-class” khi các mục 10–13 đều vượt release gate trên Apple Silicon thật.
 
 ## Nguồn chính thức dùng cho kế hoạch
 
 - [Apple Container README](https://github.com/apple/container/blob/main/README.md)
 - [Apple Container Machine guide](https://github.com/apple/container/blob/main/docs/container-machine.md)
 - [Apple Container command reference](https://github.com/apple/container/blob/main/docs/command-reference.md)
+- [Apple Container multiplatform images](https://github.com/apple/container/blob/main/docs/multiplatform-images.md)
 - [Apple Containerization design](https://github.com/apple/containerization/blob/main/README.md)
 - [Apple Virtualization framework](https://developer.apple.com/documentation/virtualization)
+- [Apple: VZLinuxRosettaDirectoryShare](https://developer.apple.com/documentation/virtualization/vzlinuxrosettadirectoryshare)
+- [Apple: Running Intel binaries in Linux VMs](https://developer.apple.com/documentation/virtualization/running-intel-binaries-in-linux-vms)
+- [Apple: Running GUI Linux in a virtual machine on a Mac](https://developer.apple.com/documentation/virtualization/running-gui-linux-in-a-virtual-machine-on-a-mac)
 - [Microsoft: Comparing WSL versions](https://learn.microsoft.com/en-us/windows/wsl/compare-versions)
 - [Microsoft: Basic commands for WSL](https://learn.microsoft.com/en-us/windows/wsl/basic-commands)
 - [Microsoft: systemd in WSL](https://learn.microsoft.com/en-us/windows/wsl/systemd)
 - [Microsoft: Import a custom Linux distribution](https://learn.microsoft.com/en-us/windows/wsl/use-custom-distro)
+- [Microsoft WSLg architecture](https://github.com/microsoft/wslg)
+- [Microsoft: Run Linux GUI apps with WSL](https://learn.microsoft.com/en-us/windows/wsl/tutorials/gui-apps)
+- [Apple Container issue: amd64 Container Machine fails with exec format error](https://github.com/apple/container/issues/1843)
